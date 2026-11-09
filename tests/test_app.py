@@ -5,7 +5,7 @@ import tornado.websocket
 import tornado.gen
 
 from tornado.testing import AsyncHTTPTestCase
-from tornado.httpclient import HTTPError
+from tornado.httpclient import HTTPError, HTTPRequest
 from tornado.options import options
 from tests.sshserver import run_ssh_server, banner, Server
 from tests.utils import encode_multipart_formdata, read_file, make_tests_data_path  # noqa
@@ -25,6 +25,14 @@ except ImportError:
 
 swallow_http_errors = handler.swallow_http_errors
 server_encodings = {e.strip() for e in Server.encodings}
+
+
+def make_test_handlers(loop):
+    routes = make_handlers(loop, options)
+    pattern, _, kwargs = routes[0]
+    # Upstream form and SSH tests dial their own fixture ports.
+    routes[0] = (pattern, handler.IndexHandler, kwargs)
+    return routes
 
 
 class TestAppBase(AsyncHTTPTestCase):
@@ -99,7 +107,7 @@ class TestAppBasic(TestAppBase):
         options.syshostfile = ''
         options.tdstream = ''
         options.delay = 0.1
-        app = make_app(make_handlers(loop, options), get_app_settings(options))
+        app = make_app(make_test_handlers(loop), get_app_settings(options))
         return app
 
     @classmethod
@@ -217,15 +225,13 @@ class TestAppBasic(TestAppBase):
         data = json.loads(to_str(response.body))
         self.assert_status_none(data)
 
-        clients = handler.clients
-        handler.clients = {}
         url = url.replace('http', 'ws')
         ws_url = url + 'ws?id=' + data['id']
-        ws = yield tornado.websocket.websocket_connect(ws_url)
+        request = HTTPRequest(ws_url, headers={'X-Real-Ip': '127.0.0.2'})
+        ws = yield tornado.websocket.websocket_connect(request)
         msg = yield ws.read_message()
         self.assertIsNone(msg)
         self.assertEqual(ws.close_reason, 'Websocket authentication failed.')
-        handler.clients = clients
 
     @tornado.testing.gen_test
     def test_app_with_correct_credentials_user_robey(self):
@@ -536,7 +542,7 @@ class OtherTestBase(TestAppBase):
         options.tdstream = self.tdstream
         options.maxconn = self.maxconn
         options.origin = self.origin
-        app = make_app(make_handlers(loop, options), get_app_settings(options))
+        app = make_app(make_test_handlers(loop), get_app_settings(options))
         return app
 
     def setUp(self):
