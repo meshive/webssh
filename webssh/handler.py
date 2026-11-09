@@ -1,6 +1,8 @@
+import hmac
 import io
 import json
 import logging
+import math
 import socket
 import struct
 import traceback
@@ -17,7 +19,9 @@ from webssh.utils import (
     to_int, to_ip_address, UnicodeType, is_ip_hostname, is_same_primary_domain,
     is_valid_encoding
 )
-from webssh.worker import Worker, recycle_worker, clients
+from webssh.worker import (
+    Worker, clients, pending_workers, recycle_worker, release_client_slot
+)
 
 try:
     from json.decoder import JSONDecodeError
@@ -31,6 +35,7 @@ except ImportError:
 
 
 DEFAULT_PORT = 22
+ATTACH_COOKIE_PREFIX = '__Host-meshive-ws-'
 
 swallow_http_errors = True
 redirecting = None
@@ -278,6 +283,18 @@ class MixinHandler(object):
     def get_context_addr(self):
         return self.context.address[:2]
 
+    def get_attachment_scheme(self):
+        if 'https' in (self.request.protocol, self.context._orig_protocol):
+            return 'https'
+
+        # Tornado can prefer X-Scheme and does not normalize Traefik's WSS
+        # upgrade header. Preserve the proxy's external TLS indication.
+        forwarded_proto = self.request.headers.get('X-Forwarded-Proto', '')
+        forwarded_scheme = forwarded_proto.rsplit(',', 1)[-1].strip()
+        if options.xheaders and forwarded_scheme in ('https', 'wss'):
+            return 'https'
+        return 'http'
+
     def get_client_addr(self):
         if options.xheaders:
             return self.get_real_client_addr() or self.get_context_addr()
@@ -405,10 +422,7 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
             pkey = None
 
         self.ssh_client.totp = totp
-        args = (hostname, port, username, password, pkey)
-        logging.debug(args)
-
-        return args
+        return hostname, port, username, password, pkey
 
     def parse_encoding(self, data):
         try:
@@ -452,23 +466,27 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         logging.info('Connecting to {}:{}'.format(*dst_addr))
 
         try:
-            ssh.connect(*args, timeout=options.timeout)
-        except socket.error:
-            raise ValueError('Unable to connect to {}:{}'.format(*dst_addr))
-        except paramiko.BadAuthenticationType:
-            raise ValueError('Bad authentication type.')
-        except paramiko.AuthenticationException:
-            raise ValueError('Authentication failed.')
-        except paramiko.BadHostKeyException:
-            raise ValueError('Bad host key.')
+            try:
+                ssh.connect(*args, timeout=options.timeout)
+            except socket.error:
+                raise ValueError('Unable to connect to {}:{}'.format(*dst_addr))
+            except paramiko.BadAuthenticationType:
+                raise ValueError('Bad authentication type.')
+            except paramiko.AuthenticationException:
+                raise ValueError('Authentication failed.')
+            except paramiko.BadHostKeyException:
+                raise ValueError('Bad host key.')
 
-        term = self.get_argument('term', u'') or u'xterm'
-        chan = ssh.invoke_shell(term=term)
-        chan.setblocking(0)
-        worker = Worker(self.loop, ssh, chan, dst_addr)
-        worker.encoding = options.encoding if options.encoding else \
-            self.get_default_encoding(ssh)
-        return worker
+            term = self.get_argument('term', u'') or u'xterm'
+            chan = ssh.invoke_shell(term=term)
+            chan.setblocking(0)
+            worker = Worker(self.loop, ssh, chan, dst_addr)
+            worker.encoding = options.encoding if options.encoding else \
+                self.get_default_encoding(ssh)
+            return worker
+        except Exception:
+            ssh.close()
+            raise
 
     def check_origin(self):
         event_origin = self.get_argument('_origin', u'')
@@ -497,8 +515,8 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
             raise ValueError('Uncaught exception')
 
         ip, port = self.get_client_addr()
-        workers = clients.get(ip, {})
-        if workers and len(workers) >= options.maxconn:
+        slots = clients.get(ip)
+        if slots and len(slots) >= options.maxconn:
             raise tornado.web.HTTPError(403, 'Too many live connections.')
 
         self.check_origin()
@@ -508,20 +526,37 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         except InvalidValueError as exc:
             raise tornado.web.HTTPError(400, str(exc))
 
-        future = self.executor.submit(self.ssh_connect, args)
-
+        # Hold the slot across the SSH dial, including concurrent POSTs.
+        slots = clients.setdefault(ip, {})
+        reservation = object()
+        slots[reservation] = None
         try:
-            worker = yield future
+            worker = yield self.executor.submit(self.ssh_connect, args)
         except (ValueError, paramiko.SSHException) as exc:
             logging.error(traceback.format_exc())
             self.result.update(status=str(exc))
         else:
-            if not workers:
-                clients[ip] = workers
             worker.src_addr = (ip, port)
-            workers[worker.id] = worker
-            self.loop.call_later(options.delay, recycle_worker, worker)
-            self.result.update(id=worker.id, encoding=worker.encoding)
+            try:
+                worker.attach_scheme = self.get_attachment_scheme()
+                worker.attach_deadline = self.loop.time() + options.delay
+                if worker.attach_scheme == 'https':
+                    nonce = Worker.gen_id()
+                    worker.attach_nonce = nonce.encode('ascii')
+                    self.set_cookie(
+                        ATTACH_COOKIE_PREFIX + worker.id, nonce, path='/',
+                        secure=True, httponly=True, samesite='Strict',
+                        max_age=int(math.ceil(options.delay)),
+                    )
+                slots[worker.id] = None
+                pending_workers[worker.id] = worker
+                self.loop.call_at(worker.attach_deadline, recycle_worker, worker)
+                self.result.update(id=worker.id, encoding=worker.encoding)
+            except Exception:
+                worker.close(reason='worker registration failed')
+                raise
+        finally:
+            release_client_slot(ip, reservation)
 
         self.write(self.result)
 
@@ -532,33 +567,56 @@ class WsockHandler(MixinHandler, tornado.websocket.WebSocketHandler):
         super(WsockHandler, self).initialize(loop)
         self.worker_ref = None
 
+    def matches_attachment(self, worker):
+        scheme = self.get_attachment_scheme()
+        if scheme != worker.attach_scheme:
+            return False
+        if scheme == 'http':
+            # Keep the original IP check for allowed plaintext connections.
+            return worker.src_addr[0] == self.src_addr[0]
+
+        cookie = self.get_cookie(ATTACH_COOKIE_PREFIX + worker.id)
+        return cookie is not None and hmac.compare_digest(
+            worker.attach_nonce, cookie.encode('ascii', 'replace'))
+
     def open(self):
         self.src_addr = self.get_client_addr()
         logging.info('Connected from {}:{}'.format(*self.src_addr))
-
-        workers = clients.get(self.src_addr[0])
-        if not workers:
-            self.close(reason='Websocket authentication failed.')
-            return
 
         try:
             worker_id = self.get_value('id')
         except (tornado.web.MissingArgumentError, InvalidValueError) as exc:
             self.close(reason=str(exc))
-        else:
-            worker = workers.get(worker_id)
-            if worker:
-                workers[worker_id] = None
-                self.set_nodelay(True)
-                worker.set_handler(self)
-                self.worker_ref = weakref.ref(worker)
-                self.loop.add_handler(worker.fd, worker, IOLoop.READ)
-            else:
-                self.close(reason='Websocket authentication failed.')
+            return
+
+        worker = pending_workers.get(worker_id)
+        if worker is None:
+            self.close(reason='Websocket authentication failed.')
+            return
+        if self.loop.time() >= worker.attach_deadline:
+            recycle_worker(worker)
+            self.close(reason='Websocket authentication failed.')
+            return
+
+        if not self.matches_attachment(worker):
+            self.close(reason='Websocket authentication failed.')
+            return
+
+        # Only an authorized WebSocket can claim the pending worker, once.
+        pending_workers.pop(worker_id)
+        worker.attach_nonce = None
+        try:
+            self.set_nodelay(True)
+            worker.set_handler(self)
+            self.worker_ref = weakref.ref(worker)
+            self.loop.add_handler(worker.fd, worker, IOLoop.READ)
+        except Exception:
+            worker.close(reason='websocket attachment failed')
+            raise
 
     def on_message(self, message):
         logging.debug('{!r} from {}:{}'.format(message, *self.src_addr))
-        worker = self.worker_ref()
+        worker = self.worker_ref() if self.worker_ref else None
         if not worker:
             # The worker has likely been closed. Do not process.
             logging.debug(

@@ -12,23 +12,20 @@ from tornado.util import errno_from_exception
 
 
 BUF_SIZE = 32 * 1024
-clients = {}  # {ip: {id: worker}}
+clients = {}  # {ip: {slot: None}} for connection limits only
+pending_workers = {}  # {id: worker} until the browser attaches
 
 
-def clear_worker(worker, clients):
-    ip = worker.src_addr[0]
-    workers = clients.get(ip)
-    assert worker.id in workers
-    workers.pop(worker.id)
-
-    if not workers:
-        clients.pop(ip)
-        if not clients:
-            clients.clear()
+def release_client_slot(ip, slot):
+    slots = clients.get(ip)
+    if slots is not None:
+        slots.pop(slot, None)
+        if not slots:
+            clients.pop(ip, None)
 
 
 def recycle_worker(worker):
-    if worker.handler:
+    if worker.closed or worker.handler:
         return
     logging.warning('Recycling worker {}'.format(worker.id))
     worker.close(reason='worker recycled')
@@ -42,6 +39,10 @@ class Worker(object):
         self.dst_addr = dst_addr
         self.fd = chan.fileno()
         self.id = self.gen_id()
+        self.src_addr = None
+        self.attach_scheme = None
+        self.attach_nonce = None
+        self.attach_deadline = None
         self.data_to_dst = []
         self.handler = None
         self.mode = IOLoop.READ
@@ -119,16 +120,21 @@ class Worker(object):
         if self.closed:
             return
         self.closed = True
+        self.attach_nonce = None
+        pending_workers.pop(self.id, None)
+        if self.src_addr is not None:
+            release_client_slot(self.src_addr[0], self.id)
 
         logging.info(
             'Closing worker {} with reason: {}'.format(self.id, reason)
         )
-        if self.handler:
-            self.loop.remove_handler(self.fd)
-            self.handler.close(reason=reason)
-        self.chan.close()
-        self.ssh.close()
+        try:
+            if self.handler:
+                self.loop.remove_handler(self.fd)
+                self.handler.close(reason=reason)
+        finally:
+            try:
+                self.chan.close()
+            finally:
+                self.ssh.close()
         logging.info('Connection to {}:{} lost'.format(*self.dst_addr))
-
-        clear_worker(self, clients)
-        logging.debug(clients)
