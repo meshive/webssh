@@ -287,11 +287,11 @@ class MixinHandler(object):
         if 'https' in (self.request.protocol, self.context._orig_protocol):
             return 'https'
 
-        # X-Scheme takes precedence in Tornado. It must not downgrade TLS at
-        # the reverse proxy, which reports the external scheme in X-Forwarded-Proto.
+        # Tornado can prefer X-Scheme and does not normalize Traefik's WSS
+        # upgrade header. Preserve the proxy's external TLS indication.
         forwarded_proto = self.request.headers.get('X-Forwarded-Proto', '')
         forwarded_scheme = forwarded_proto.rsplit(',', 1)[-1].strip()
-        if options.xheaders and forwarded_scheme == 'https':
+        if options.xheaders and forwarded_scheme in ('https', 'wss'):
             return 'https'
         return 'http'
 

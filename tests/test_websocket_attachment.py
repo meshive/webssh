@@ -123,8 +123,9 @@ class TestWebsocketAttachment(AsyncHTTPTestCase):
 
     async def open(self, worker_id, cookie=None, ip=WEBSOCKET_IP, origin=None,
                    scheme='https', x_scheme=None):
+        origin_scheme = {'ws': 'http', 'wss': 'https'}.get(scheme, scheme)
         default_origin = self.get_url('/').rstrip('/').replace(
-            'http:', scheme + ':', 1)
+            'http:', origin_scheme + ':', 1)
         headers = forwarded_headers(ip, scheme, x_scheme)
         headers['Origin'] = origin or default_origin
         if cookie:
@@ -178,9 +179,9 @@ class TestWebsocketAttachment(AsyncHTTPTestCase):
         self.assertTrue(worker_id)
         self.assertFalse(response.headers.get_list('Set-Cookie'))
 
-        await self.assert_rejected(worker_id, scheme='http')
+        await self.assert_rejected(worker_id, scheme='ws')
         await self.assert_rejected(worker_id, ip=POST_IP)
-        connection = await self.open(worker_id, ip=POST_IP, scheme='http')
+        connection = await self.open(worker_id, ip=POST_IP, scheme='ws')
         self.assertEqual(await connection.read_message(), BANNER)
         connection.close()
         await self.wait_until_ssh_closed(worker_id)
@@ -198,6 +199,17 @@ class TestWebsocketAttachment(AsyncHTTPTestCase):
         worker_id, cookie = self.credentials(await self.post(x_scheme='http'))
         await self.assert_rejected(worker_id, ip=POST_IP, x_scheme='http')
         connection = await self.open(worker_id, cookie, x_scheme='http')
+        self.assertEqual(await connection.read_message(), BANNER)
+        connection.close()
+        await self.wait_until_ssh_closed(worker_id)
+
+    @gen_test
+    async def test_traefik_forwarded_wss_attaches_across_ip_change(self):
+        worker_id, cookie = self.credentials(await self.post())
+        await self.assert_rejected(worker_id, ip=POST_IP, scheme='wss')
+        await self.assert_rejected(worker_id, cookie, ip=POST_IP, scheme='ws')
+
+        connection = await self.open(worker_id, cookie, scheme='wss')
         self.assertEqual(await connection.read_message(), BANNER)
         connection.close()
         await self.wait_until_ssh_closed(worker_id)
